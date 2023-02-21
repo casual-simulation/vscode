@@ -5,8 +5,8 @@
 
 use chrono::Local;
 use opentelemetry::{
-	sdk::trace::Tracer,
-	trace::{SpanBuilder, Tracer as TraitTracer},
+	sdk::trace::{Tracer, TracerProvider},
+	trace::{SpanBuilder, Tracer as TraitTracer, TracerProvider as TracerProviderTrait},
 };
 use std::fmt;
 use std::{env, path::Path, sync::Arc};
@@ -105,7 +105,7 @@ pub fn new_rpc_prefix() -> String {
 // Base logger implementation
 #[derive(Clone)]
 pub struct Logger {
-	tracer: Tracer,
+	tracer: Arc<Tracer>,
 	sink: Vec<Box<dyn LogSink>>,
 	prefix: Option<String>,
 }
@@ -135,6 +135,7 @@ impl Clone for Box<dyn LogSink> {
 	}
 }
 
+/// The basic log sink that writes output to stdout, with colors when relevant.
 #[derive(Clone)]
 pub struct StdioLogSink {
 	level: Level,
@@ -186,9 +187,17 @@ impl LogSink for FileLogSink {
 }
 
 impl Logger {
+	pub fn test() -> Self {
+		Self {
+			tracer: Arc::new(TracerProvider::builder().build().tracer("codeclitest")),
+			sink: vec![],
+			prefix: None,
+		}
+	}
+
 	pub fn new(tracer: Tracer, level: Level) -> Self {
 		Self {
-			tracer,
+			tracer: Arc::new(tracer),
 			sink: vec![Box::new(StdioLogSink { level })],
 			prefix: None,
 		}
@@ -209,9 +218,9 @@ impl Logger {
 		}
 	}
 
-	pub fn result(&self, message: &str) {
+	pub fn result(&self, message: impl AsRef<str>) {
 		for sink in &self.sink {
-			sink.write_result(message);
+			sink.write_result(message.as_ref());
 		}
 	}
 
@@ -235,6 +244,17 @@ impl Logger {
 
 		Logger {
 			sink: new_sinks,
+			..self.clone()
+		}
+	}
+
+	/// Creates a new logger with the sink replace with the given sink.
+	pub fn with_sink<T>(&self, sink: T) -> Logger
+	where
+		T: LogSink + 'static,
+	{
+		Logger {
+			sink: vec![Box::new(sink)],
 			..self.clone()
 		}
 	}

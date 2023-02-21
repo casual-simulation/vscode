@@ -14,7 +14,8 @@ import { ICodeEditorOpenHandler, ICodeEditorService } from 'vs/editor/browser/se
 import { IContentDecorationRenderOptions, IDecorationRenderOptions, IThemeDecorationRenderOptions, isThemeColor } from 'vs/editor/common/editorCommon';
 import { IModelDecorationOptions, IModelDecorationOverviewRulerOptions, InjectedTextOptions, ITextModel, OverviewRulerLane, TrackedRangeStickiness } from 'vs/editor/common/model';
 import { IResourceEditorInput } from 'vs/platform/editor/common/editor';
-import { IColorTheme, IThemeService, ThemeColor } from 'vs/platform/theme/common/themeService';
+import { IColorTheme, IThemeService } from 'vs/platform/theme/common/themeService';
+import { ThemeColor } from 'vs/base/common/themables';
 
 export abstract class AbstractCodeEditorService extends Disposable implements ICodeEditorService {
 
@@ -293,7 +294,7 @@ export class ModelTransientSettingWatcher {
 	}
 }
 
-export class RefCountedStyleSheet {
+class RefCountedStyleSheet {
 
 	private readonly _parent: AbstractCodeEditorService;
 	private readonly _editorId: string;
@@ -366,7 +367,7 @@ interface IModelDecorationOptionsProvider extends IDisposable {
 	resolveDecorationCSSRules(): CSSRuleList;
 }
 
-export class DecorationSubTypeOptionsProvider implements IModelDecorationOptionsProvider {
+class DecorationSubTypeOptionsProvider implements IModelDecorationOptionsProvider {
 
 	private readonly _styleSheet: GlobalStyleSheet | RefCountedStyleSheet;
 	public refCount: number;
@@ -421,7 +422,7 @@ interface ProviderArguments {
 }
 
 
-export class DecorationTypeOptionsProvider implements IModelDecorationOptionsProvider {
+class DecorationTypeOptionsProvider implements IModelDecorationOptionsProvider {
 
 	private readonly _disposables = new DisposableStore();
 	private readonly _styleSheet: GlobalStyleSheet | RefCountedStyleSheet;

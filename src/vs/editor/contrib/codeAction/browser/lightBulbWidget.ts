@@ -6,6 +6,7 @@
 import * as dom from 'vs/base/browser/dom';
 import { Gesture } from 'vs/base/browser/touch';
 import { Codicon } from 'vs/base/common/codicons';
+import { ThemeIcon } from 'vs/base/common/themables';
 import { Emitter, Event } from 'vs/base/common/event';
 import { Disposable } from 'vs/base/common/lifecycle';
 import { withNullAsUndefined } from 'vs/base/common/types';
@@ -17,8 +18,6 @@ import { computeIndentLevel } from 'vs/editor/common/model/utils';
 import type { CodeActionSet, CodeActionTrigger } from 'vs/editor/contrib/codeAction/common/types';
 import * as nls from 'vs/nls';
 import { IKeybindingService } from 'vs/platform/keybinding/common/keybinding';
-import { editorBackground, editorLightBulbAutoFixForeground, editorLightBulbForeground } from 'vs/platform/theme/common/colorRegistry';
-import { IColorTheme, ICssStyleCollector, registerThemingParticipant } from 'vs/platform/theme/common/themeService';
 
 namespace LightBulbState {
 
@@ -48,7 +47,7 @@ export class LightBulbWidget extends Disposable implements IContentWidget {
 
 	private static readonly _posPref = [ContentWidgetPositionPreference.EXACT];
 
-	private readonly _domNode: HTMLDivElement;
+	private readonly _domNode: HTMLElement;
 
 	private readonly _onClick = this._register(new Emitter<{ x: number; y: number; actions: CodeActionSet; trigger: CodeActionTrigger }>());
 	public readonly onClick = this._onClick.event;
@@ -65,8 +64,9 @@ export class LightBulbWidget extends Disposable implements IContentWidget {
 		@IKeybindingService keybindingService: IKeybindingService
 	) {
 		super();
-		this._domNode = document.createElement('div');
-		this._domNode.className = Codicon.lightBulb.classNames;
+
+		this._domNode = dom.$('div.lightBulbWidget');
+
 		this._register(Gesture.ignoreTarget(this._domNode));
 
 		this._editor.addContentWidget(this);
@@ -211,8 +211,8 @@ export class LightBulbWidget extends Disposable implements IContentWidget {
 	private _updateLightBulbTitleAndIcon(): void {
 		if (this.state.type === LightBulbState.Type.Showing && this.state.actions.hasAutoFix) {
 			// update icon
-			this._domNode.classList.remove(...Codicon.lightBulb.classNamesArray);
-			this._domNode.classList.add(...Codicon.lightbulbAutofix.classNamesArray);
+			this._domNode.classList.remove(...ThemeIcon.asClassNameArray(Codicon.lightBulb));
+			this._domNode.classList.add(...ThemeIcon.asClassNameArray(Codicon.lightbulbAutofix));
 
 			if (this._preferredKbLabel) {
 				this.title = nls.localize('preferredcodeActionWithKb', "Show Code Actions. Preferred Quick Fix Available ({0})", this._preferredKbLabel);
@@ -221,8 +221,8 @@ export class LightBulbWidget extends Disposable implements IContentWidget {
 		}
 
 		// update icon
-		this._domNode.classList.remove(...Codicon.lightbulbAutofix.classNamesArray);
-		this._domNode.classList.add(...Codicon.lightBulb.classNamesArray);
+		this._domNode.classList.remove(...ThemeIcon.asClassNameArray(Codicon.lightbulbAutofix));
+		this._domNode.classList.add(...ThemeIcon.asClassNameArray(Codicon.lightBulb));
 
 		if (this._quickFixKbLabel) {
 			this.title = nls.localize('codeActionWithKb', "Show Code Actions ({0})", this._quickFixKbLabel);
@@ -235,29 +235,3 @@ export class LightBulbWidget extends Disposable implements IContentWidget {
 		this._domNode.title = value;
 	}
 }
-
-registerThemingParticipant((theme: IColorTheme, collector: ICssStyleCollector) => {
-
-	const editorBackgroundColor = theme.getColor(editorBackground)?.transparent(0.7);
-
-	// Lightbulb Icon
-	const editorLightBulbForegroundColor = theme.getColor(editorLightBulbForeground);
-	if (editorLightBulbForegroundColor) {
-		collector.addRule(`
-		.monaco-editor .contentWidgets ${Codicon.lightBulb.cssSelector} {
-			color: ${editorLightBulbForegroundColor};
-			background-color: ${editorBackgroundColor};
-		}`);
-	}
-
-	// Lightbulb Auto Fix Icon
-	const editorLightBulbAutoFixForegroundColor = theme.getColor(editorLightBulbAutoFixForeground);
-	if (editorLightBulbAutoFixForegroundColor) {
-		collector.addRule(`
-		.monaco-editor .contentWidgets ${Codicon.lightbulbAutofix.cssSelector} {
-			color: ${editorLightBulbAutoFixForegroundColor};
-			background-color: ${editorBackgroundColor};
-		}`);
-	}
-
-});

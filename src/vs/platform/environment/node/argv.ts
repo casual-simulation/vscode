@@ -38,9 +38,9 @@ export interface Subcommand<T> {
 
 export type OptionDescriptions<T> = {
 	[P in keyof T]:
-	T[P] extends boolean ? Option<'boolean'> :
-	T[P] extends string ? Option<'string'> :
-	T[P] extends string[] ? Option<'string[]'> :
+	T[P] extends boolean | undefined ? Option<'boolean'> :
+	T[P] extends string | undefined ? Option<'string'> :
+	T[P] extends string[] | undefined ? Option<'string[]'> :
 	Subcommand<T[P]>
 };
 
@@ -77,7 +77,7 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'waitMarkerFilePath': { type: 'string' },
 	'locale': { type: 'string', cat: 'o', args: 'locale', description: localize('locale', "The locale to use (e.g. en-US or zh-TW).") },
 	'user-data-dir': { type: 'string', cat: 'o', args: 'dir', description: localize('userDataDir', "Specifies the directory that user data is kept in. Can be used to open multiple distinct instances of Code.") },
-	'profile': { type: 'string', 'cat': 'o', args: 'settingsProfileName', description: localize('settingsProfileName', "Opens the provided folder or workspace with the given profile and associates the profile with the workspace. If the profile does not exist, a new empty one is created. A folder or workspace must be provided for the profile to take effect.") },
+	'profile': { type: 'string', 'cat': 'o', args: 'profileName', description: localize('profileName', "Opens the provided folder or workspace with the given profile and associates the profile with the workspace. If the profile does not exist, a new empty one is created. A folder or workspace must be provided for the profile to take effect.") },
 	'help': { type: 'boolean', cat: 'o', alias: 'h', description: localize('help', "Print usage.") },
 
 	'extensions-dir': { type: 'string', deprecates: ['extensionHomePath'], cat: 'e', args: 'dir', description: localize('extensionHomePath', "Set the root path for extensions.") },
@@ -97,11 +97,13 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'status': { type: 'boolean', alias: 's', cat: 't', description: localize('status', "Print process usage and diagnostics information.") },
 	'prof-startup': { type: 'boolean', cat: 't', description: localize('prof-startup', "Run CPU profiler during startup.") },
 	'prof-append-timers': { type: 'string' },
+	'prof-duration-markers': { type: 'string[]' },
+	'prof-duration-markers-file': { type: 'string' },
 	'no-cached-data': { type: 'boolean' },
 	'prof-startup-prefix': { type: 'string' },
 	'prof-v8-extensions': { type: 'boolean' },
-	'disable-extensions': { type: 'boolean', deprecates: ['disableExtensions'], cat: 't', description: localize('disableExtensions', "Disable all installed extensions.") },
-	'disable-extension': { type: 'string[]', cat: 't', args: 'ext-id', description: localize('disableExtension', "Disable an extension.") },
+	'disable-extensions': { type: 'boolean', deprecates: ['disableExtensions'], cat: 't', description: localize('disableExtensions', "Disable all installed extensions. This option is not persisted and is effective only when the command opens a new window.") },
+	'disable-extension': { type: 'string[]', cat: 't', args: 'ext-id', description: localize('disableExtension', "Disable the provided extension. This option is not persisted and is effective only when the command opens a new window.") },
 	'sync': { type: 'string', cat: 't', description: localize('turn sync', "Turn sync on or off."), args: ['on | off'] },
 
 	'inspect-extensions': { type: 'string', allowEmptyValue: true, deprecates: ['debugPluginHost'], args: 'port', cat: 't', description: localize('inspect-extensions', "Allow debugging and profiling of extensions. Check the developer tools for the connection URI.") },
@@ -249,7 +251,8 @@ export function parseArgs<T>(args: string[], options: OptionDescriptions<T>, err
 		const reporter = errorReporter.getSubcommandReporter ? errorReporter.getSubcommandReporter(firstArg) : undefined;
 		const subcommandOptions = parseArgs(newArgs, options, reporter);
 		return <T>{
-			[firstArg]: subcommandOptions
+			[firstArg]: subcommandOptions,
+			_: []
 		};
 	}
 

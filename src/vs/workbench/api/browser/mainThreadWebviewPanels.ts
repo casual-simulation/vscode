@@ -4,8 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { onUnexpectedError } from 'vs/base/common/errors';
+import { Event } from 'vs/base/common/event';
 import { Disposable, DisposableMap } from 'vs/base/common/lifecycle';
 import { URI } from 'vs/base/common/uri';
+import { generateUuid } from 'vs/base/common/uuid';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { IStorageService } from 'vs/platform/storage/common/storage';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
@@ -13,7 +15,7 @@ import { MainThreadWebviews, reviveWebviewContentOptions, reviveWebviewExtension
 import * as extHostProtocol from 'vs/workbench/api/common/extHost.protocol';
 import { DiffEditorInput } from 'vs/workbench/common/editor/diffEditorInput';
 import { EditorInput } from 'vs/workbench/common/editor/editorInput';
-import { WebviewOptions, WebviewOriginStore } from 'vs/workbench/contrib/webview/browser/webview';
+import { ExtensionKeyedWebviewOriginStore, WebviewOptions } from 'vs/workbench/contrib/webview/browser/webview';
 import { WebviewInput } from 'vs/workbench/contrib/webviewPanel/browser/webviewEditorInput';
 import { WebviewIcons } from 'vs/workbench/contrib/webviewPanel/browser/webviewIconManager';
 import { IWebViewShowOptions, IWebviewWorkbenchService } from 'vs/workbench/contrib/webviewPanel/browser/webviewWorkbenchService';
@@ -86,7 +88,7 @@ export class MainThreadWebviewPanels extends Disposable implements extHostProtoc
 
 	private readonly _revivers = this._register(new DisposableMap<string>());
 
-	private readonly webviewOriginStore: WebviewOriginStore;
+	private readonly webviewOriginStore: ExtensionKeyedWebviewOriginStore;
 
 	constructor(
 		context: IExtHostContext,
@@ -101,15 +103,17 @@ export class MainThreadWebviewPanels extends Disposable implements extHostProtoc
 	) {
 		super();
 
-		this.webviewOriginStore = new WebviewOriginStore('mainThreadWebviewPanel.origins', storageService);
+		this.webviewOriginStore = new ExtensionKeyedWebviewOriginStore('mainThreadWebviewPanel.origins', storageService);
 
 		this._proxy = context.getProxy(extHostProtocol.ExtHostContext.ExtHostWebviewPanels);
 
-		this._register(_editorService.onDidActiveEditorChange(() => {
-			this.updateWebviewViewStates(this._editorService.activeEditor);
-		}));
-
-		this._register(_editorService.onDidVisibleEditorsChange(() => {
+		this._register(Event.any(
+			_editorService.onDidActiveEditorChange,
+			_editorService.onDidVisibleEditorsChange,
+			_editorGroupService.onDidAddGroup,
+			_editorGroupService.onDidRemoveGroup,
+			_editorGroupService.onDidMoveGroup,
+		)(() => {
 			this.updateWebviewViewStates(this._editorService.activeEditor);
 		}));
 
@@ -161,9 +165,9 @@ export class MainThreadWebviewPanels extends Disposable implements extHostProtoc
 		const origin = this.webviewOriginStore.getOrigin(viewType, extension.id);
 
 		const webview = this._webviewWorkbenchService.openWebview({
-			id: handle,
 			origin,
 			providedViewType: viewType,
+			title: initData.title,
 			options: reviveWebviewOptions(initData.panelOptions),
 			contentOptions: reviveWebviewContentOptions(initData.webviewOptions),
 			extension
@@ -257,11 +261,11 @@ export class MainThreadWebviewPanels extends Disposable implements extHostProtoc
 			resolveWebview: async (webviewInput): Promise<void> => {
 				const viewType = this.webviewPanelViewType.toExternal(webviewInput.viewType);
 				if (!viewType) {
-					webviewInput.webview.html = this._mainThreadWebviews.getWebviewResolvedFailedContent(webviewInput.viewType);
+					webviewInput.webview.setHtml(this._mainThreadWebviews.getWebviewResolvedFailedContent(webviewInput.viewType));
 					return;
 				}
 
-				const handle = webviewInput.id;
+				const handle = generateUuid();
 
 				this.addWebviewInput(handle, webviewInput, options);
 
@@ -284,7 +288,7 @@ export class MainThreadWebviewPanels extends Disposable implements extHostProtoc
 					}, editorGroupToColumn(this._editorGroupService, webviewInput.group || 0));
 				} catch (error) {
 					onUnexpectedError(error);
-					webviewInput.webview.html = this._mainThreadWebviews.getWebviewResolvedFailedContent(viewType);
+					webviewInput.webview.setHtml(this._mainThreadWebviews.getWebviewResolvedFailedContent(viewType));
 				}
 			}
 		}));

@@ -2,27 +2,36 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-use crate::constants::{CONTROL_PORT, PROTOCOL_VERSION, VSCODE_CLI_VERSION};
+use crate::constants::{CONTROL_PORT, EDITOR_WEB_URL, QUALITYLESS_SERVER_NAME};
 use crate::log;
+use crate::rpc::{MaybeSync, RpcBuilder, RpcDispatcher, Serialization};
+use crate::self_update::SelfUpdate;
 use crate::state::LauncherPaths;
-use crate::update::Update;
-use crate::update_service::Platform;
+use crate::tunnels::protocol::HttpRequestParams;
+use crate::tunnels::socket_signal::CloseReason;
+use crate::update_service::{Platform, UpdateService};
 use crate::util::errors::{
-	wrap, AnyError, MismatchedLaunchModeError, NoAttachedServerError, ServerWriteError,
+	wrap, AnyError, InvalidRpcDataError, MismatchedLaunchModeError, NoAttachedServerError,
 };
+use crate::util::http::{
+	DelegatedHttpRequest, DelegatedSimpleHttp, FallbackSimpleHttp, ReqwestSimpleHttp,
+};
+use crate::util::io::SilentCopyProgress;
+use crate::util::is_integrated_cli;
 use crate::util::sync::{new_barrier, Barrier};
+
 use opentelemetry::trace::SpanKind;
 use opentelemetry::KeyValue;
-use serde::Serialize;
-use std::convert::Infallible;
+use std::collections::HashMap;
+
 use std::env;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::pin;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use super::code_server::{
 	AnyCodeServer, CodeServerArgs, ServerBuilder, ServerParamsRaw, SocketCodeServer,
@@ -31,64 +40,56 @@ use super::dev_tunnels::ActiveTunnel;
 use super::paths::prune_stopped_servers;
 use super::port_forwarder::{PortForwarding, PortForwardingProcessor};
 use super::protocol::{
-	CallServerHttpParams, CallServerHttpResult, ClientRequestMethod, EmptyResult, ErrorResponse,
-	ForwardParams, ForwardResult, GetHostnameResponse, RefServerMessageParams, ResponseError,
-	ServeParams, ServerLog, ServerMessageParams, ServerRequestMethod, SuccessResponse,
-	ToClientRequest, ToServerRequest, UnforwardParams, UpdateParams, UpdateResult, VersionParams,
+	CallServerHttpParams, CallServerHttpResult, ClientRequestMethod, EmptyObject, ForwardParams,
+	ForwardResult, GetHostnameResponse, HttpBodyParams, HttpHeadersParams, ServeParams, ServerLog,
+	ServerMessageParams, ToClientRequest, UnforwardParams, UpdateParams, UpdateResult,
+	VersionParams,
 };
-use super::server_bridge::{get_socket_rw_stream, FromServerMessage, ServerBridge};
+use super::server_bridge::{get_socket_rw_stream, ServerBridge};
+use super::server_multiplexer::ServerMultiplexer;
+use super::shutdown_signal::ShutdownSignal;
+use super::socket_signal::{
+	ClientMessageDecoder, ServerMessageDestination, ServerMessageSink, SocketSignal,
+};
 
-type ServerBridgeList = Option<Vec<(u16, ServerBridge)>>;
-type ServerBridgeListLock = Arc<Mutex<ServerBridgeList>>;
+type HttpRequestsMap = Arc<std::sync::Mutex<HashMap<u32, DelegatedHttpRequest>>>;
+type CodeServerCell = Arc<Mutex<Option<SocketCodeServer>>>;
 
 struct HandlerContext {
-	/// Exit barrier for the socket.
-	closer: Barrier<()>,
 	/// Log handle for the server
 	log: log::Logger,
-	/// A loopback channel to talk to the TCP server task.
-	server_tx: mpsc::Sender<ServerSignal>,
+	/// Whether the server update during the handler session.
+	did_update: Arc<AtomicBool>,
 	/// A loopback channel to talk to the socket server task.
 	socket_tx: mpsc::Sender<SocketSignal>,
 	/// Configured launcher paths.
 	launcher_paths: LauncherPaths,
 	/// Connected VS Code Server
-	code_server: Option<SocketCodeServer>,
+	code_server: CodeServerCell,
 	/// Potentially many "websocket" connections to client
-	server_bridges: ServerBridgeListLock,
+	server_bridges: ServerMultiplexer,
 	// the cli arguments used to start the code server
 	code_server_args: CodeServerArgs,
-	/// counter for the number of bytes received from the socket
-	rx_counter: Arc<AtomicUsize>,
 	/// port forwarding functionality
 	port_forwarding: PortForwarding,
 	/// install platform for the VS Code server
 	platform: Platform,
+	/// http client to make download/update requests
+	http: FallbackSimpleHttp,
+	/// requests being served by the client
+	http_requests: HttpRequestsMap,
+}
+
+static MESSAGE_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// Gets a next incrementing number that can be used in logs
+pub fn next_message_id() -> u32 {
+	MESSAGE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
 impl HandlerContext {
-	async fn dispose(self) {
-		let bridges: ServerBridgeList = {
-			let mut lock = self.server_bridges.lock().await;
-			let bridges = lock.take();
-			*lock = None;
-			bridges
-		};
-
-		if let Some(b) = bridges {
-			for (_, bridge) in b {
-				if let Err(e) = bridge.close().await {
-					warning!(
-						self.log,
-						"Could not properly dispose of connection context: {}",
-						e
-					)
-				} else {
-					debug!(self.log, "Closed server bridge.");
-				}
-			}
-		}
-
+	async fn dispose(&self) {
+		self.server_bridges.dispose().await;
 		info!(self.log, "Disposed of connection to running server.");
 	}
 }
@@ -102,39 +103,6 @@ enum ServerSignal {
 	Respawn,
 }
 
-struct CloseReason(String);
-
-enum SocketSignal {
-	/// Signals bytes to send to the socket.
-	Send(Vec<u8>),
-	/// Closes the socket (e.g. as a result of an error)
-	CloseWith(CloseReason),
-	/// Disposes ServerBridge corresponding to an ID
-	CloseServerBridge(u16),
-}
-
-impl SocketSignal {
-	fn from_message<T>(msg: &T) -> Self
-	where
-		T: Serialize + ?Sized,
-	{
-		SocketSignal::Send(rmp_serde::to_vec_named(msg).unwrap())
-	}
-}
-
-impl FromServerMessage for SocketSignal {
-	fn from_server_message(i: u16, body: &[u8]) -> Self {
-		SocketSignal::from_message(&ToClientRequest {
-			id: None,
-			params: ClientRequestMethod::servermsg(RefServerMessageParams { i, body }),
-		})
-	}
-
-	fn from_closed_server_bridge(i: u16) -> Self {
-		SocketSignal::CloseServerBridge(i)
-	}
-}
-
 pub struct ServerTermination {
 	/// Whether the server should be respawned in a new binary (see ServerSignal.Respawn).
 	pub respawn: bool,
@@ -142,9 +110,11 @@ pub struct ServerTermination {
 }
 
 fn print_listening(log: &log::Logger, tunnel_name: &str) {
-	debug!(log, "VS Code Server is listening for incoming connections");
+	debug!(
+		log,
+		"{} is listening for incoming connections", QUALITYLESS_SERVER_NAME
+	);
 
-	let extension_name = "+ms-vscode.remote-server";
 	let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from(""));
 	let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from(""));
 
@@ -154,10 +124,15 @@ fn print_listening(log: &log::Logger, tunnel_name: &str) {
 		current_dir
 	};
 
-	let mut addr = url::Url::parse("https://insiders.vscode.dev").unwrap();
+	let base_web_url = match EDITOR_WEB_URL {
+		Some(u) => u,
+		None => return,
+	};
+
+	let mut addr = url::Url::parse(base_web_url).unwrap();
 	{
 		let mut ps = addr.path_segments_mut().unwrap();
-		ps.push(extension_name);
+		ps.push("tunnel");
 		ps.push(tunnel_name);
 		for segment in &dir {
 			let as_str = segment.to_string_lossy();
@@ -180,7 +155,7 @@ pub async fn serve(
 	launcher_paths: &LauncherPaths,
 	code_server_args: &CodeServerArgs,
 	platform: Platform,
-	shutdown_rx: oneshot::Receiver<()>,
+	shutdown_rx: mpsc::UnboundedReceiver<ShutdownSignal>,
 ) -> Result<ServerTermination, AnyError> {
 	let mut port = tunnel.add_port_direct(CONTROL_PORT).await?;
 	print_listening(log, &tunnel.name);
@@ -193,8 +168,8 @@ pub async fn serve(
 
 	loop {
 		tokio::select! {
-			_ = &mut shutdown_rx => {
-				info!(log, "Received interrupt, shutting down...");
+			Some(r) = shutdown_rx.recv() => {
+				info!(log, "Shutting down: {}", r );
 				drop(signal_exit);
 				return Ok(ServerTermination {
 					respawn: false,
@@ -264,6 +239,19 @@ struct SocketStats {
 	tx: usize,
 }
 
+#[derive(Copy, Clone)]
+struct MsgPackSerializer {}
+
+impl Serialization for MsgPackSerializer {
+	fn serialize(&self, value: impl serde::Serialize) -> Vec<u8> {
+		rmp_serde::to_vec_named(&value).expect("expected to serialize")
+	}
+
+	fn deserialize<P: serde::de::DeserializeOwned>(&self, b: &[u8]) -> Result<P, AnyError> {
+		rmp_serde::from_slice(b).map_err(|e| InvalidRpcDataError(e.to_string()).into())
+	}
+}
+
 #[allow(clippy::too_many_arguments)] // necessary here
 async fn process_socket(
 	mut exit_barrier: Barrier<()>,
@@ -277,42 +265,97 @@ async fn process_socket(
 	platform: Platform,
 ) -> SocketStats {
 	let (socket_tx, mut socket_rx) = mpsc::channel(4);
-
 	let rx_counter = Arc::new(AtomicUsize::new(0));
-
-	let server_bridges: ServerBridgeListLock = Arc::new(Mutex::new(Some(vec![])));
-	let server_bridges_lock = Arc::clone(&server_bridges);
-	let barrier_ctx = exit_barrier.clone();
-	let log_ctx = log.clone();
-	let rx_counter_ctx = rx_counter.clone();
-
-	tokio::spawn(async move {
-		let mut ctx = HandlerContext {
-			closer: barrier_ctx,
-			server_tx,
-			socket_tx,
-			log: log_ctx,
-			launcher_paths,
-			code_server_args,
-			rx_counter: rx_counter_ctx,
-			code_server: None,
-			server_bridges: server_bridges_lock,
-			port_forwarding,
-			platform,
-		};
-
-		send_version(&ctx.socket_tx).await;
-
-		if let Err(e) = handle_socket_read(readhalf, &mut ctx).await {
-			debug!(ctx.log, "closing socket reader: {}", e);
-			ctx.socket_tx
-				.send(SocketSignal::CloseWith(CloseReason(format!("{}", e))))
-				.await
-				.ok();
-		}
-
-		ctx.dispose().await;
+	let http_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
+	let server_bridges = ServerMultiplexer::new();
+	let (http_delegated, mut http_rx) = DelegatedSimpleHttp::new(log.clone());
+	let mut rpc = RpcBuilder::new(MsgPackSerializer {}).methods(HandlerContext {
+		did_update: Arc::new(AtomicBool::new(false)),
+		socket_tx: socket_tx.clone(),
+		log: log.clone(),
+		launcher_paths,
+		code_server_args,
+		code_server: Arc::new(Mutex::new(None)),
+		server_bridges: server_bridges.clone(),
+		port_forwarding,
+		platform,
+		http: FallbackSimpleHttp::new(ReqwestSimpleHttp::new(), http_delegated),
+		http_requests: http_requests.clone(),
 	});
+
+	rpc.register_sync("ping", |_: EmptyObject, _| Ok(EmptyObject {}));
+	rpc.register_sync("gethostname", |_: EmptyObject, _| handle_get_hostname());
+	rpc.register_async("serve", move |params: ServeParams, c| async move {
+		handle_serve(c, params).await
+	});
+	rpc.register_async("update", |p: UpdateParams, c| async move {
+		handle_update(&c.http, &c.log, &c.did_update, &p).await
+	});
+	rpc.register_sync("servermsg", |m: ServerMessageParams, c| {
+		if let Err(e) = handle_server_message(&c.log, &c.server_bridges, m) {
+			warning!(c.log, "error handling call: {:?}", e);
+		}
+		Ok(EmptyObject {})
+	});
+	rpc.register_sync("prune", |_: EmptyObject, c| handle_prune(&c.launcher_paths));
+	rpc.register_async("callserverhttp", |p: CallServerHttpParams, c| async move {
+		let code_server = c.code_server.lock().await.clone();
+		handle_call_server_http(code_server, p).await
+	});
+	rpc.register_async("forward", |p: ForwardParams, c| async move {
+		handle_forward(&c.log, &c.port_forwarding, p).await
+	});
+	rpc.register_async("unforward", |p: UnforwardParams, c| async move {
+		handle_unforward(&c.log, &c.port_forwarding, p).await
+	});
+	rpc.register_sync("httpheaders", |p: HttpHeadersParams, c| {
+		if let Some(req) = c.http_requests.lock().unwrap().get(&p.req_id) {
+			req.initial_response(p.status_code, p.headers);
+		}
+		Ok(EmptyObject {})
+	});
+	rpc.register_sync("unforward", move |p: HttpBodyParams, c| {
+		let mut reqs = c.http_requests.lock().unwrap();
+		if let Some(req) = reqs.get(&p.req_id) {
+			if !p.segment.is_empty() {
+				req.body(p.segment);
+			}
+			if p.complete {
+				reqs.remove(&p.req_id);
+			}
+		}
+		Ok(EmptyObject {})
+	});
+
+	{
+		let log = log.clone();
+		let rx_counter = rx_counter.clone();
+		let socket_tx = socket_tx.clone();
+		let exit_barrier = exit_barrier.clone();
+		let rpc = rpc.build(log.clone());
+		tokio::spawn(async move {
+			send_version(&socket_tx).await;
+
+			if let Err(e) =
+				handle_socket_read(&log, readhalf, exit_barrier, &socket_tx, rx_counter, &rpc).await
+			{
+				debug!(log, "closing socket reader: {}", e);
+				socket_tx
+					.send(SocketSignal::CloseWith(CloseReason(format!("{}", e))))
+					.await
+					.ok();
+			}
+
+			let ctx = rpc.context();
+
+			// The connection is now closed, asked to respawn if needed
+			if ctx.did_update.load(Ordering::SeqCst) {
+				server_tx.send(ServerSignal::Respawn).await.ok();
+			}
+
+			ctx.dispose().await;
+		});
+	}
 
 	let mut tx_counter = 0;
 
@@ -322,6 +365,25 @@ async fn process_socket(
 				writehalf.shutdown().await.ok();
 				break;
 			},
+			Some(r) = http_rx.recv() => {
+				let id = next_message_id();
+				let serialized = rmp_serde::to_vec_named(&ToClientRequest {
+					id: None,
+					params: ClientRequestMethod::makehttpreq(HttpRequestParams {
+						url: &r.url,
+						method: r.method,
+						req_id: id,
+					}),
+				})
+				.unwrap();
+				http_requests.lock().unwrap().insert(id, r);
+
+				tx_counter += serialized.len();
+				if let Err(e) = writehalf.write_all(&serialized).await {
+					debug!(log, "Closing connection: {}", e);
+					break;
+				}
+			}
 			recv = socket_rx.recv() => match recv {
 				None => break,
 				Some(message) => match message {
@@ -335,17 +397,6 @@ async fn process_socket(
 					SocketSignal::CloseWith(reason) => {
 						debug!(log, "Closing connection: {}", reason.0);
 						break;
-					}
-					SocketSignal::CloseServerBridge(id) => {
-						let mut lock = server_bridges.lock().await;
-						match &mut *lock {
-							Some(bridges) => {
-								if let Some(index) = bridges.iter().position(|(i, _)| *i == id) {
-									(*bridges).remove(index as usize);
-								}
-							},
-							None => {}
-						}
 					}
 				}
 			}
@@ -361,137 +412,73 @@ async fn process_socket(
 async fn send_version(tx: &mpsc::Sender<SocketSignal>) {
 	tx.send(SocketSignal::from_message(&ToClientRequest {
 		id: None,
-		params: ClientRequestMethod::version(VersionParams {
-			version: VSCODE_CLI_VERSION.unwrap_or("dev"),
-			protocol_version: PROTOCOL_VERSION,
-		}),
+		params: ClientRequestMethod::version(VersionParams::default()),
 	}))
 	.await
 	.ok();
 }
 async fn handle_socket_read(
+	_log: &log::Logger,
 	readhalf: impl AsyncRead + Unpin,
-	ctx: &mut HandlerContext,
+	mut closer: Barrier<()>,
+	socket_tx: &mpsc::Sender<SocketSignal>,
+	rx_counter: Arc<AtomicUsize>,
+	rpc: &RpcDispatcher<MsgPackSerializer, HandlerContext>,
 ) -> Result<(), std::io::Error> {
 	let mut socket_reader = BufReader::new(readhalf);
 	let mut decode_buf = vec![];
-	let mut did_update = false;
 
-	let result = loop {
-		match read_next(&mut socket_reader, ctx, &mut decode_buf, &mut did_update).await {
-			Ok(false) => break Ok(()),
-			Ok(true) => { /* continue */ }
-			Err(e) => break Err(e),
+	loop {
+		let read = read_next(
+			&mut socket_reader,
+			&rx_counter,
+			&mut closer,
+			&mut decode_buf,
+		)
+		.await;
+
+		match read {
+			Ok(len) => match rpc.dispatch(&decode_buf[..len]) {
+				MaybeSync::Sync(Some(v)) => {
+					if socket_tx.send(SocketSignal::Send(v)).await.is_err() {
+						return Ok(());
+					}
+				}
+				MaybeSync::Sync(None) => continue,
+				MaybeSync::Future(fut) => {
+					let socket_tx = socket_tx.clone();
+					tokio::spawn(async move {
+						if let Some(v) = fut.await {
+							socket_tx.send(SocketSignal::Send(v)).await.ok();
+						}
+					});
+				}
+			},
+			Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+			Err(e) => return Err(e),
 		}
-	};
-
-	// The connection is now closed, asked to respawn if needed
-	if did_update {
-		ctx.server_tx.send(ServerSignal::Respawn).await.ok();
 	}
-
-	result
 }
 
-/// Reads and handles the next data packet, returns true if the read loop should continue.
+/// Reads and handles the next data packet. Returns the next packet to dispatch,
+/// or an error (including EOF).
 async fn read_next(
 	socket_reader: &mut BufReader<impl AsyncRead + Unpin>,
-	ctx: &mut HandlerContext,
+	rx_counter: &Arc<AtomicUsize>,
+	closer: &mut Barrier<()>,
 	decode_buf: &mut Vec<u8>,
-	did_update: &mut bool,
-) -> Result<bool, std::io::Error> {
+) -> Result<usize, std::io::Error> {
 	let msg_length = tokio::select! {
 		u = socket_reader.read_u32() => u? as usize,
-		_ = ctx.closer.wait() => return Ok(false),
+		_ = closer.wait() => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
 	};
 	decode_buf.resize(msg_length, 0);
-	ctx.rx_counter
-		.fetch_add(msg_length + 4 /* u32 */, Ordering::Relaxed);
+	rx_counter.fetch_add(msg_length + 4 /* u32 */, Ordering::Relaxed);
 
 	tokio::select! {
-		r = socket_reader.read_exact(decode_buf) => r?,
-		_ = ctx.closer.wait() => return Ok(false),
-	};
-
-	let req = match rmp_serde::from_slice::<ToServerRequest>(decode_buf) {
-		Ok(req) => req,
-		Err(e) => {
-			warning!(ctx.log, "Error decoding message: {}", e);
-			return Ok(true); // not fatal
-		}
-	};
-
-	let log = ctx.log.prefixed(
-		req.id
-			.map(|id| format!("[call.{}]", id))
-			.as_deref()
-			.unwrap_or("notify"),
-	);
-
-	macro_rules! success {
-		($r:expr) => {
-			req.id
-				.map(|id| rmp_serde::to_vec_named(&SuccessResponse { id, result: &$r }))
-		};
+		r = socket_reader.read_exact(decode_buf) => r,
+		_ = closer.wait() => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
 	}
-
-	macro_rules! tj {
-		($name:expr, $e:expr) => {
-			match (spanf!(
-				log,
-				log.span(&format!("call.{}", $name))
-					.with_kind(opentelemetry::trace::SpanKind::Server),
-				$e
-			)) {
-				Ok(r) => success!(r),
-				Err(e) => {
-					warning!(log, "error handling call: {:?}", e);
-					req.id.map(|id| {
-						rmp_serde::to_vec_named(&ErrorResponse {
-							id,
-							error: ResponseError {
-								code: -1,
-								message: format!("{:?}", e),
-							},
-						})
-					})
-				}
-			}
-		};
-	}
-
-	let response = match req.params {
-		ServerRequestMethod::ping(_) => success!(EmptyResult {}),
-		ServerRequestMethod::serve(p) => tj!("serve", handle_serve(ctx, &log, p)),
-		ServerRequestMethod::prune => tj!("prune", handle_prune(ctx)),
-		ServerRequestMethod::gethostname(_) => tj!("gethostname", handle_get_hostname()),
-		ServerRequestMethod::update(p) => tj!("update", async {
-			let r = handle_update(ctx, &p).await;
-			if matches!(&r, Ok(u) if u.did_update) {
-				*did_update = true;
-			}
-			r
-		}),
-		ServerRequestMethod::servermsg(m) => {
-			if let Err(e) = handle_server_message(ctx, m).await {
-				warning!(log, "error handling call: {:?}", e);
-			}
-			None
-		}
-		ServerRequestMethod::callserverhttp(p) => {
-			tj!("callserverhttp", handle_call_server_http(ctx, p))
-		}
-		ServerRequestMethod::forward(p) => tj!("forward", handle_forward(ctx, p)),
-		ServerRequestMethod::unforward(p) => tj!("unforward", handle_unforward(ctx, p)),
-	};
-
-	if let Some(Ok(res)) = response {
-		if ctx.socket_tx.send(SocketSignal::Send(res)).await.is_err() {
-			return Ok(false);
-		}
-	}
-
-	Ok(true)
 }
 
 #[derive(Clone)]
@@ -516,97 +503,134 @@ impl log::LogSink for ServerOutputSink {
 }
 
 async fn handle_serve(
-	ctx: &mut HandlerContext,
-	log: &log::Logger,
+	c: Arc<HandlerContext>,
 	params: ServeParams,
-) -> Result<EmptyResult, AnyError> {
-	let mut code_server_args = ctx.code_server_args.clone();
-
+) -> Result<EmptyObject, AnyError> {
 	// fill params.extensions into code_server_args.install_extensions
-	code_server_args
-		.install_extensions
-		.extend(params.extensions.into_iter());
+	let mut csa = c.code_server_args.clone();
+	csa.install_extensions.extend(params.extensions.into_iter());
 
-	let resolved = ServerParamsRaw {
+	let params_raw = ServerParamsRaw {
 		commit_id: params.commit_id,
 		quality: params.quality,
-		code_server_args,
+		code_server_args: csa,
 		headless: true,
-		platform: ctx.platform,
-	}
-	.resolve(log)
-	.await?;
+		platform: c.platform,
+	};
 
-	if ctx.code_server.is_none() {
-		let install_log = log.tee(ServerOutputSink {
-			tx: ctx.socket_tx.clone(),
-		});
-		let sb = ServerBuilder::new(&install_log, &resolved, &ctx.launcher_paths);
+	let resolved = if params.use_local_download {
+		params_raw.resolve(&c.log, c.http.delegated()).await
+	} else {
+		params_raw.resolve(&c.log, c.http.clone()).await
+	}?;
 
-		let server = match sb.get_running().await? {
-			Some(AnyCodeServer::Socket(s)) => s,
-			Some(_) => return Err(AnyError::from(MismatchedLaunchModeError())),
-			None => {
-				sb.setup().await?;
-				sb.listen_on_default_socket().await?
+	let mut server_ref = c.code_server.lock().await;
+	let server = match &*server_ref {
+		Some(o) => o.clone(),
+		None => {
+			let install_log = c.log.tee(ServerOutputSink {
+				tx: c.socket_tx.clone(),
+			});
+
+			macro_rules! do_setup {
+				($sb:expr) => {
+					match $sb.get_running().await? {
+						Some(AnyCodeServer::Socket(s)) => s,
+						Some(_) => return Err(AnyError::from(MismatchedLaunchModeError())),
+						None => {
+							$sb.setup(None).await?;
+							$sb.listen_on_default_socket().await?
+						}
+					}
+				};
 			}
-		};
 
-		ctx.code_server = Some(server);
-	}
+			let server = if params.use_local_download {
+				let sb = ServerBuilder::new(
+					&install_log,
+					&resolved,
+					&c.launcher_paths,
+					c.http.delegated(),
+				);
+				do_setup!(sb)
+			} else {
+				let sb =
+					ServerBuilder::new(&install_log, &resolved, &c.launcher_paths, c.http.clone());
+				do_setup!(sb)
+			};
 
-	attach_server_bridge(ctx, params.socket_id).await?;
-	Ok(EmptyResult {})
+			server_ref.replace(server.clone());
+			server
+		}
+	};
+
+	attach_server_bridge(
+		&c.log,
+		server,
+		c.socket_tx.clone(),
+		c.server_bridges.clone(),
+		params.socket_id,
+		params.compress,
+	)
+	.await?;
+	Ok(EmptyObject {})
 }
 
-async fn attach_server_bridge(ctx: &mut HandlerContext, socket_id: u16) -> Result<u16, AnyError> {
-	let attached_fut = ServerBridge::new(
-		&ctx.code_server.as_ref().unwrap().socket,
-		socket_id,
-		&ctx.socket_tx,
-	)
-	.await;
+async fn attach_server_bridge(
+	log: &log::Logger,
+	code_server: SocketCodeServer,
+	socket_tx: mpsc::Sender<SocketSignal>,
+	multiplexer: ServerMultiplexer,
+	socket_id: u16,
+	compress: bool,
+) -> Result<u16, AnyError> {
+	let (server_messages, decoder) = if compress {
+		(
+			ServerMessageSink::new_compressed(
+				multiplexer.clone(),
+				socket_id,
+				ServerMessageDestination::Channel(socket_tx),
+			),
+			ClientMessageDecoder::new_compressed(),
+		)
+	} else {
+		(
+			ServerMessageSink::new_plain(
+				multiplexer.clone(),
+				socket_id,
+				ServerMessageDestination::Channel(socket_tx),
+			),
+			ClientMessageDecoder::new_plain(),
+		)
+	};
 
+	let attached_fut = ServerBridge::new(&code_server.socket, server_messages, decoder).await;
 	match attached_fut {
 		Ok(a) => {
-			let mut lock = ctx.server_bridges.lock().await;
-			match &mut *lock {
-				Some(server_bridges) => (*server_bridges).push((socket_id, a)),
-				None => *lock = Some(vec![(socket_id, a)]),
-			}
-			trace!(ctx.log, "Attached to server");
+			multiplexer.register(socket_id, a);
+			trace!(log, "Attached to server");
 			Ok(socket_id)
 		}
 		Err(e) => Err(e),
 	}
 }
 
-async fn handle_server_message(
-	ctx: &mut HandlerContext,
+/// Handle an incoming server message. This is synchronous and uses a 'write loop'
+/// to ensure message order is preserved exactly, which is necessary for compression.
+fn handle_server_message(
+	log: &log::Logger,
+	multiplexer: &ServerMultiplexer,
 	params: ServerMessageParams,
-) -> Result<EmptyResult, AnyError> {
-	let mut lock = ctx.server_bridges.lock().await;
-
-	match &mut *lock {
-		Some(server_bridges) => {
-			let matched_bridge = server_bridges.iter_mut().find(|(id, _)| *id == params.i);
-
-			match matched_bridge {
-				Some((_, sb)) => sb
-					.write(params.body)
-					.await
-					.map_err(|_| AnyError::from(ServerWriteError()))?,
-				None => return Err(AnyError::from(NoAttachedServerError())),
-			}
-		}
-		None => return Err(AnyError::from(NoAttachedServerError())),
+) -> Result<EmptyObject, AnyError> {
+	if multiplexer.write_message(log, params.i, params.body) {
+		Ok(EmptyObject {})
+	} else {
+		Err(AnyError::from(NoAttachedServerError()))
 	}
-
-	Ok(EmptyResult {})
 }
 
-async fn handle_prune(ctx: &HandlerContext) -> Result<Vec<String>, AnyError> {
-	prune_stopped_servers(&ctx.launcher_paths).map(|v| {
+fn handle_prune(paths: &LauncherPaths) -> Result<Vec<String>, AnyError> {
+	prune_stopped_servers(paths).map(|v| {
 		v.iter()
 			.map(|p| p.server_dir.display().to_string())
 			.collect()
@@ -614,16 +638,22 @@ async fn handle_prune(ctx: &HandlerContext) -> Result<Vec<String>, AnyError> {
 }
 
 async fn handle_update(
-	ctx: &HandlerContext,
+	http: &FallbackSimpleHttp,
+	log: &log::Logger,
+	did_update: &AtomicBool,
 	params: &UpdateParams,
 ) -> Result<UpdateResult, AnyError> {
-	let updater = Update::new();
-	let latest_release = updater.get_latest_release().await?;
+	if matches!(is_integrated_cli(), Ok(true)) || did_update.load(Ordering::SeqCst) {
+		return Ok(UpdateResult {
+			up_to_date: true,
+			did_update: false,
+		});
+	}
 
-	let up_to_date = match VSCODE_CLI_VERSION {
-		Some(v) => v == latest_release.version,
-		None => true,
-	};
+	let update_service = UpdateService::new(log.clone(), http.clone());
+	let updater = SelfUpdate::new(&update_service)?;
+	let latest_release = updater.get_current_release().await?;
+	let up_to_date = updater.is_up_to_date_with(&latest_release);
 
 	if !params.do_update || up_to_date {
 		return Ok(UpdateResult {
@@ -632,12 +662,20 @@ async fn handle_update(
 		});
 	}
 
-	info!(ctx.log, "Updating CLI from {}", latest_release.version);
+	if did_update
+		.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+		.is_err()
+	{
+		return Ok(UpdateResult {
+			up_to_date: true,
+			did_update: true, // well, another thread did, but same difference...
+		});
+	}
 
-	let current_exe = std::env::current_exe().map_err(|e| wrap(e, "could not get current exe"))?;
+	info!(log, "Updating CLI to {}", latest_release);
 
 	updater
-		.switch_to_release(&latest_release, &current_exe)
+		.do_update(&latest_release, SilentCopyProgress())
 		.await?;
 
 	Ok(UpdateResult {
@@ -646,32 +684,34 @@ async fn handle_update(
 	})
 }
 
-async fn handle_get_hostname() -> Result<GetHostnameResponse, Infallible> {
+fn handle_get_hostname() -> Result<GetHostnameResponse, AnyError> {
 	Ok(GetHostnameResponse {
 		value: gethostname::gethostname().to_string_lossy().into_owned(),
 	})
 }
 
 async fn handle_forward(
-	ctx: &HandlerContext,
+	log: &log::Logger,
+	port_forwarding: &PortForwarding,
 	params: ForwardParams,
 ) -> Result<ForwardResult, AnyError> {
-	info!(ctx.log, "Forwarding port {}", params.port);
-	let uri = ctx.port_forwarding.forward(params.port).await?;
+	info!(log, "Forwarding port {}", params.port);
+	let uri = port_forwarding.forward(params.port).await?;
 	Ok(ForwardResult { uri })
 }
 
 async fn handle_unforward(
-	ctx: &HandlerContext,
+	log: &log::Logger,
+	port_forwarding: &PortForwarding,
 	params: UnforwardParams,
-) -> Result<EmptyResult, AnyError> {
-	info!(ctx.log, "Unforwarding port {}", params.port);
-	ctx.port_forwarding.unforward(params.port).await?;
-	Ok(EmptyResult {})
+) -> Result<EmptyObject, AnyError> {
+	info!(log, "Unforwarding port {}", params.port);
+	port_forwarding.unforward(params.port).await?;
+	Ok(EmptyObject {})
 }
 
 async fn handle_call_server_http(
-	ctx: &HandlerContext,
+	code_server: Option<SocketCodeServer>,
 	params: CallServerHttpParams,
 ) -> Result<CallServerHttpResult, AnyError> {
 	use hyper::{body, client::conn::Builder, Body, Request};
@@ -679,7 +719,7 @@ async fn handle_call_server_http(
 	// We use Hyper directly here since reqwest doesn't support sockets/pipes.
 	// See https://github.com/seanmonstar/reqwest/issues/39
 
-	let socket = match &ctx.code_server {
+	let socket = match &code_server {
 		Some(cs) => &cs.socket,
 		None => return Err(AnyError::from(NoAttachedServerError())),
 	};

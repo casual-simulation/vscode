@@ -7,7 +7,7 @@ import { Codicon } from 'vs/base/common/codicons';
 import { localize } from 'vs/nls';
 import { IQuickPick, IQuickPickItem, QuickPickItem } from 'vs/platform/quickinput/common/quickInput';
 import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
-import { ThemeIcon } from 'vs/platform/theme/common/themeService';
+import { ThemeIcon } from 'vs/base/common/themables';
 
 const pinButtonClass = ThemeIcon.asClassName(Codicon.pin);
 const pinnedButtonClass = ThemeIcon.asClassName(Codicon.pinned);
@@ -30,9 +30,13 @@ export async function showWithPinnedItems(storageService: IStorageService, stora
 		}
 	});
 	quickPick.onDidChangeValue(async value => {
-		// Return pinned items if there is no search value
-		quickPick.items = value ? itemsWithoutPinned : itemsWithPinned;
+		if (quickPick.items === itemsWithPinned && value) {
+			quickPick.items = itemsWithoutPinned;
+		} else if (quickPick.items === itemsWithoutPinned && !value) {
+			quickPick.items = itemsWithPinned;
+		}
 	});
+
 	quickPick.items = quickPick.value ? itemsWithoutPinned : itemsWithPinned;
 	quickPick.show();
 }

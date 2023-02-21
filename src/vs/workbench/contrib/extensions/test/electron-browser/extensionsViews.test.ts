@@ -100,6 +100,7 @@ suite('ExtensionsViews Tests', () => {
 			onUninstallExtension: uninstallEvent.event,
 			onDidUninstallExtension: didUninstallEvent.event,
 			onDidChangeProfile: Event.None,
+			onDidUpdateExtensionMetadata: Event.None,
 			async getInstalled() { return []; },
 			async canInstall() { return true; },
 			async getExtensionsControlManifest() { return { malicious: [], deprecated: {} }; },
@@ -198,7 +199,7 @@ suite('ExtensionsViews Tests', () => {
 		await (<TestExtensionEnablementService>instantiationService.get(IWorkbenchExtensionEnablementService)).setEnablement([localDisabledLanguage], EnablementState.DisabledGlobally);
 
 		instantiationService.set(IExtensionsWorkbenchService, instantiationService.createInstance(ExtensionsWorkbenchService));
-		testableView = instantiationService.createInstance(ExtensionsListView, {}, {});
+		testableView = instantiationService.createInstance(ExtensionsListView, {}, { id: '', title: '' });
 	});
 
 	teardown(() => {
@@ -425,7 +426,7 @@ suite('ExtensionsViews Tests', () => {
 		const target = <SinonStub>instantiationService.stubPromise(IExtensionGalleryService, 'getExtensions', allRecommendedExtensions);
 
 		return testableView.show('@recommended').then(result => {
-			const extensionInfos: IExtensionInfo[] = target.args[1][0];
+			const extensionInfos: IExtensionInfo[] = target.args[0][0];
 
 			assert.strictEqual(extensionInfos.length, allRecommendedExtensions.length);
 			assert.strictEqual(result.length, allRecommendedExtensions.length);
@@ -450,7 +451,7 @@ suite('ExtensionsViews Tests', () => {
 		const target = <SinonStub>instantiationService.stubPromise(IExtensionGalleryService, 'getExtensions', allRecommendedExtensions);
 
 		return testableView.show('@recommended:all').then(result => {
-			const extensionInfos: IExtensionInfo[] = target.args[1][0];
+			const extensionInfos: IExtensionInfo[] = target.args[0][0];
 
 			assert.strictEqual(extensionInfos.length, allRecommendedExtensions.length);
 			assert.strictEqual(result.length, allRecommendedExtensions.length);
@@ -540,7 +541,7 @@ suite('ExtensionsViews Tests', () => {
 
 		testableView.resetSearchExperiments();
 		testableView.dispose();
-		testableView = instantiationService.createInstance(ExtensionsListView, {}, {});
+		testableView = instantiationService.createInstance(ExtensionsListView, {}, { id: '', title: '' });
 
 		return testableView.show('search-me').then(result => {
 			const options: IQueryOptions = queryTarget.args[0][0];
@@ -567,7 +568,7 @@ suite('ExtensionsViews Tests', () => {
 		const queryTarget = <SinonStub>instantiationService.stubPromise(IExtensionGalleryService, 'query', aPage(...realResults));
 
 		testableView.dispose();
-		testableView = instantiationService.createInstance(ExtensionsListView, {}, {});
+		testableView = instantiationService.createInstance(ExtensionsListView, {}, { id: '', title: '' });
 
 		return testableView.show('search-me @sort:installs').then(result => {
 			const options: IQueryOptions = queryTarget.args[0][0];

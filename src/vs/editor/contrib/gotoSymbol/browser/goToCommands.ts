@@ -40,7 +40,7 @@ import { IEditorProgressService } from 'vs/platform/progress/common/progress';
 import { getDeclarationsAtPosition, getDefinitionsAtPosition, getImplementationsAtPosition, getReferencesAtPosition, getTypeDefinitionsAtPosition } from './goToSymbol';
 import { IWordAtPosition } from 'vs/editor/common/core/wordHelper';
 import { ILanguageFeaturesService } from 'vs/editor/common/services/languageFeatures';
-import { asArray } from 'vs/base/common/arrays';
+import { Iterable } from 'vs/base/common/iterator';
 
 MenuRegistry.appendMenuItem(MenuId.EditorContext, <ISubmenuItem>{
 	submenu: MenuId.EditorContextPeek,
@@ -86,7 +86,7 @@ export abstract class SymbolNavigationAction extends EditorAction2 {
 		const result = { ...opts, f1: true };
 		// patch context menu when clause
 		if (result.menu) {
-			for (const item of asArray(result.menu)) {
+			for (const item of Iterable.wrap(result.menu)) {
 				if (item.id === MenuId.EditorContext || item.id === MenuId.EditorContextPeek) {
 					item.when = ContextKeyExpr.and(opts.precondition, item.when);
 				}
@@ -306,6 +306,7 @@ registerAction2(class GoToDefinitionAction extends DefinitionAction {
 				order: 1.1
 			}, {
 				id: MenuId.MenubarGoMenu,
+				precondition: null,
 				group: '4_symbol_nav',
 				order: 2,
 			}]
@@ -429,6 +430,7 @@ registerAction2(class GoToDeclarationAction extends DeclarationAction {
 				order: 1.3
 			}, {
 				id: MenuId.MenubarGoMenu,
+				precondition: null,
 				group: '4_symbol_nav',
 				order: 3,
 			}],
@@ -523,6 +525,7 @@ registerAction2(class GoToTypeDefinitionAction extends TypeDefinitionAction {
 				order: 1.4
 			}, {
 				id: MenuId.MenubarGoMenu,
+				precondition: null,
 				group: '4_symbol_nav',
 				order: 3,
 			}]
@@ -614,6 +617,7 @@ registerAction2(class GoToImplementationAction extends ImplementationAction {
 				order: 1.45
 			}, {
 				id: MenuId.MenubarGoMenu,
+				precondition: null,
 				group: '4_symbol_nav',
 				order: 4,
 			}]
@@ -706,6 +710,7 @@ registerAction2(class GoToReferencesAction extends ReferencesAction {
 				order: 1.45
 			}, {
 				id: MenuId.MenubarGoMenu,
+				precondition: null,
 				group: '4_symbol_nav',
 				order: 5,
 			}]
@@ -816,7 +821,7 @@ CommandsRegistry.registerCommand({
 
 			return editor.invokeWithinContext(accessor => {
 				const command = new class extends GenericGoToLocationAction {
-					override _getNoResultFoundMessage(info: IWordAtPosition | null) {
+					protected override _getNoResultFoundMessage(info: IWordAtPosition | null) {
 						return noResultsMessage || super._getNoResultFoundMessage(info);
 					}
 				}({
