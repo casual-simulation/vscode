@@ -7635,6 +7635,12 @@ declare namespace monaco.worker {
 		 * Get all available mirror models in this worker.
 		 */
 		getMirrorModels(): IMirrorModel[];
+		/**
+		 * Get all available mirror models in this worker as an object that maps model URIs to each model.
+		 */
+		getMirrorModelMap(): {
+			[uri: string]: IMirrorModel;
+		};
 	}
 
 }
