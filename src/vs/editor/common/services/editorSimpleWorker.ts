@@ -42,6 +42,10 @@ export interface IWorkerContext<H = undefined> {
 	 * Get all available mirror models in this worker.
 	 */
 	getMirrorModels(): IMirrorModel[];
+	/**
+	 * Get all available mirror models in this worker as an object that maps model URIs to each model.
+	 */
+	getMirrorModelMap(): { [uri: string]: IMirrorModel };
 }
 
 /**
@@ -649,6 +653,9 @@ export class EditorSimpleWorker implements IRequestHandler, IDisposable {
 			host: foreignHost,
 			getMirrorModels: (): IMirrorModel[] => {
 				return this._getModels();
+			},
+			getMirrorModelMap: (): { [uri: string]: IMirrorModel } => {
+				return this._models;
 			}
 		};
 
