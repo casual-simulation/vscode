@@ -10,13 +10,14 @@ import { IComposite, ICompositeControl } from 'vs/workbench/common/composite';
 import { Event, Emitter } from 'vs/base/common/event';
 import { IThemeService } from 'vs/platform/theme/common/themeService';
 import { IConstructorSignature, IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { trackFocus, Dimension, IDomPosition } from 'vs/base/browser/dom';
+import { trackFocus, Dimension, IDomPosition, focusWindow } from 'vs/base/browser/dom';
 import { IStorageService } from 'vs/platform/storage/common/storage';
 import { Disposable } from 'vs/base/common/lifecycle';
 import { assertIsDefined } from 'vs/base/common/types';
 import { IActionViewItem } from 'vs/base/browser/ui/actionbar/actionbar';
 import { MenuId } from 'vs/platform/actions/common/actions';
 import { IBoundarySashes } from 'vs/base/browser/ui/sash/sash';
+import { IBaseActionViewItemOptions } from 'vs/base/browser/ui/actionbar/actionViewItems';
 
 /**
  * Composites are layed out in the sidebar and panel part of the workbench. At a time only one composite
@@ -148,7 +149,13 @@ export abstract class Composite extends Component implements IComposite {
 	 * Called when this composite should receive keyboard focus.
 	 */
 	focus(): void {
-		// Subclasses can implement
+		const container = this.getContainer();
+		if (container) {
+			// Make sure to focus the window of the container
+			// because it is possible that the composite is
+			// opened in a auxiliary window that is not focused.
+			focusWindow(container);
+		}
 	}
 
 	/**
@@ -161,13 +168,6 @@ export abstract class Composite extends Component implements IComposite {
 	 * draggable corner areas with inner sashes.
 	 */
 	abstract setBoundarySashes(sashes: IBoundarySashes): void;
-
-	/**
-	 * Update the styles of the contents of this composite.
-	 */
-	override updateStyles(): void {
-		super.updateStyles();
-	}
 
 	/**
 	 *
@@ -205,7 +205,7 @@ export abstract class Composite extends Component implements IComposite {
 	 * of an action. Returns undefined to indicate that the action is not rendered through
 	 * an action item.
 	 */
-	getActionViewItem(action: IAction): IActionViewItem | undefined {
+	getActionViewItem(action: IAction, options: IBaseActionViewItemOptions): IActionViewItem | undefined {
 		return undefined;
 	}
 

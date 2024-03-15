@@ -12,7 +12,7 @@ import { IEditorService } from 'vs/workbench/services/editor/common/editorServic
 import { GoFilter, GoScope, IHistoryService } from 'vs/workbench/services/history/common/history';
 import { FileChangesEvent, IFileService, FileChangeType, FILES_EXCLUDE_CONFIG, FileOperationEvent, FileOperation } from 'vs/platform/files/common/files';
 import { IWorkspaceContextService } from 'vs/platform/workspace/common/workspace';
-import { dispose, Disposable, DisposableStore, IDisposable } from 'vs/base/common/lifecycle';
+import { dispose, Disposable, DisposableStore, IDisposable, toDisposable } from 'vs/base/common/lifecycle';
 import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
 import { Emitter, Event } from 'vs/base/common/event';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
@@ -24,16 +24,16 @@ import { IWorkbenchLayoutService } from 'vs/workbench/services/layout/browser/la
 import { IContextKeyService, RawContextKey } from 'vs/platform/contextkey/common/contextkey';
 import { coalesce, remove } from 'vs/base/common/arrays';
 import { InstantiationType, registerSingleton } from 'vs/platform/instantiation/common/extensions';
-import { addDisposableListener, EventType, EventHelper } from 'vs/base/browser/dom';
+import { addDisposableListener, EventType, EventHelper, WindowIdleValue } from 'vs/base/browser/dom';
 import { IWorkspacesService } from 'vs/platform/workspaces/common/workspaces';
 import { Schemas } from 'vs/base/common/network';
 import { onUnexpectedError } from 'vs/base/common/errors';
-import { IdleValue } from 'vs/base/common/async';
 import { ResourceGlobMatcher } from 'vs/workbench/common/resources';
 import { IPathService } from 'vs/workbench/services/path/common/pathService';
 import { IUriIdentityService } from 'vs/platform/uriIdentity/common/uriIdentity';
 import { ILifecycleService, LifecyclePhase } from 'vs/workbench/services/lifecycle/common/lifecycle';
 import { ILogService, LogLevel } from 'vs/platform/log/common/log';
+import { mainWindow } from 'vs/base/browser/window';
 
 export class HistoryService extends Disposable implements IHistoryService {
 
@@ -46,6 +46,8 @@ export class HistoryService extends Disposable implements IHistoryService {
 	private lastActiveEditor: IEditorIdentifier | undefined = undefined;
 
 	private readonly editorHelper = this.instantiationService.createInstance(EditorHelper);
+
+
 
 	constructor(
 		@IEditorService private readonly editorService: EditorServiceImpl,
@@ -71,16 +73,31 @@ export class HistoryService extends Disposable implements IHistoryService {
 		}
 	}
 
+	private trackingSuspended = false;
+	suspendTracking(): IDisposable {
+		this.trackingSuspended = true;
+
+		return toDisposable(() => this.trackingSuspended = false);
+	}
+
 	private registerListeners(): void {
 
 		// Mouse back/forward support
 		this.registerMouseNavigationListener();
 
 		// Editor changes
-		this._register(this.editorService.onDidActiveEditorChange(() => this.onDidActiveEditorChange()));
+		this._register(this.editorService.onDidActiveEditorChange((e) => {
+			if (!this.trackingSuspended) {
+				this.onDidActiveEditorChange();
+			}
+		}));
 		this._register(this.editorService.onDidOpenEditorFail(event => this.remove(event.editor)));
 		this._register(this.editorService.onDidCloseEditor(event => this.onDidCloseEditor(event)));
-		this._register(this.editorService.onDidMostRecentlyActiveEditorsChange(() => this.handleEditorEventInRecentEditorsStack()));
+		this._register(this.editorService.onDidMostRecentlyActiveEditorsChange(() => {
+			if (!this.trackingSuspended) {
+				this.handleEditorEventInRecentEditorsStack();
+			}
+		}));
 
 		// Editor group changes
 		this._register(this.editorGroupService.onDidRemoveGroup(e => this.onDidRemoveGroup(e)));
@@ -111,7 +128,13 @@ export class HistoryService extends Disposable implements IHistoryService {
 			mouseBackForwardSupportListener.clear();
 
 			if (this.configurationService.getValue(HistoryService.MOUSE_NAVIGATION_SETTING)) {
-				mouseBackForwardSupportListener.add(addDisposableListener(this.layoutService.container, EventType.MOUSE_DOWN, e => this.onMouseDown(e)));
+				this._register(Event.runAndSubscribe(this.layoutService.onDidAddContainer, ({ container, disposables }) => {
+					const eventDisposables = disposables.add(new DisposableStore());
+					eventDisposables.add(addDisposableListener(container, EventType.MOUSE_DOWN, e => this.onMouseDownOrUp(e, true)));
+					eventDisposables.add(addDisposableListener(container, EventType.MOUSE_UP, e => this.onMouseDownOrUp(e, false)));
+
+					mouseBackForwardSupportListener.add(eventDisposables);
+				}, { container: this.layoutService.mainContainer, disposables: this._store }));
 			}
 		};
 
@@ -124,17 +147,26 @@ export class HistoryService extends Disposable implements IHistoryService {
 		handleMouseBackForwardSupport();
 	}
 
-	private onMouseDown(event: MouseEvent): void {
+	private onMouseDownOrUp(event: MouseEvent, isMouseDown: boolean): void {
 
 		// Support to navigate in history when mouse buttons 4/5 are pressed
+		// We want to trigger this on mouse down for a faster experience
+		// but we also need to prevent mouse up from triggering the default
+		// which is to navigate in the browser history.
+
 		switch (event.button) {
 			case 3:
 				EventHelper.stop(event);
-				this.goBack();
+				if (isMouseDown) {
+					this.goBack();
+				}
 				break;
 			case 4:
 				EventHelper.stop(event);
-				this.goForward();
+				if (isMouseDown) {
+					this.goForward();
+				}
+
 				break;
 		}
 	}
@@ -160,12 +192,13 @@ export class HistoryService extends Disposable implements IHistoryService {
 		this.handleActiveEditorChange(activeEditorGroup, activeEditorPane);
 
 		// Listen to selection changes if the editor pane
-		// is having a selection concept. We use `accumulate`
-		// on the event to reduce the pressure on the editor
-		// to reduce input latency.
-
+		// is having a selection concept.
 		if (isEditorPaneWithSelection(activeEditorPane)) {
-			this.activeEditorListeners.add(Event.accumulate(activeEditorPane.onDidChangeSelection)(e => this.handleActiveEditorSelectionChangeEvents(activeEditorGroup, activeEditorPane, e)));
+			this.activeEditorListeners.add(activeEditorPane.onDidChangeSelection(e => {
+				if (!this.trackingSuspended) {
+					this.handleActiveEditorSelectionChangeEvent(activeEditorGroup, activeEditorPane, e);
+				}
+			}));
 		}
 
 		// Context keys
@@ -201,10 +234,8 @@ export class HistoryService extends Disposable implements IHistoryService {
 		this.handleActiveEditorChangeInNavigationStacks(group, editorPane);
 	}
 
-	private handleActiveEditorSelectionChangeEvents(group: IEditorGroup, editorPane: IEditorPaneWithSelection, events: IEditorPaneSelectionChangeEvent[]): void {
-		for (const event of events) {
-			this.handleActiveEditorSelectionChangeInNavigationStacks(group, editorPane, event);
-		}
+	private handleActiveEditorSelectionChangeEvent(group: IEditorGroup, editorPane: IEditorPaneWithSelection, event: IEditorPaneSelectionChangeEvent): void {
+		this.handleActiveEditorSelectionChangeInNavigationStacks(group, editorPane, event);
 	}
 
 	private move(event: FileOperationEvent): void {
@@ -739,7 +770,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 
 	private readonly editorHistoryListeners = new Map<EditorInput, DisposableStore>();
 
-	private readonly resourceExcludeMatcher = this._register(new IdleValue(() => {
+	private readonly resourceExcludeMatcher = this._register(new WindowIdleValue(mainWindow, () => {
 		const matcher = this._register(this.instantiationService.createInstance(
 			ResourceGlobMatcher,
 			root => getExcludes(root ? this.configurationService.getValue<ISearchConfiguration>({ resource: root }) : this.configurationService.getValue<ISearchConfiguration>()) || Object.create(null),
@@ -1047,7 +1078,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 
 	//#region Last Active Workspace/File
 
-	getLastActiveWorkspaceRoot(schemeFilter?: string): URI | undefined {
+	getLastActiveWorkspaceRoot(schemeFilter?: string, authorityFilter?: string): URI | undefined {
 
 		// No Folder: return early
 		const folders = this.contextService.getWorkspace().folders;
@@ -1058,7 +1089,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 		// Single Folder: return early
 		if (folders.length === 1) {
 			const resource = folders[0].uri;
-			if (!schemeFilter || resource.scheme === schemeFilter) {
+			if ((!schemeFilter || resource.scheme === schemeFilter) && (!authorityFilter || resource.authority === authorityFilter)) {
 				return resource;
 			}
 
@@ -1075,6 +1106,10 @@ export class HistoryService extends Disposable implements IHistoryService {
 				continue;
 			}
 
+			if (authorityFilter && input.resource.authority !== authorityFilter) {
+				continue;
+			}
+
 			const resourceWorkspace = this.contextService.getWorkspaceFolder(input.resource);
 			if (resourceWorkspace) {
 				return resourceWorkspace.uri;
@@ -1084,7 +1119,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 		// Fallback to first workspace matching scheme filter if any
 		for (const folder of folders) {
 			const resource = folder.uri;
-			if (!schemeFilter || resource.scheme === schemeFilter) {
+			if ((!schemeFilter || resource.scheme === schemeFilter) && (!authorityFilter || resource.authority === authorityFilter)) {
 				return resource;
 			}
 		}
@@ -1092,7 +1127,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 		return undefined;
 	}
 
-	getLastActiveFile(filterByScheme: string): URI | undefined {
+	getLastActiveFile(filterByScheme: string, filterByAuthority?: string): URI | undefined {
 		for (const input of this.getHistory()) {
 			let resource: URI | undefined;
 			if (isEditorInput(input)) {
@@ -1101,7 +1136,7 @@ export class HistoryService extends Disposable implements IHistoryService {
 				resource = input.resource;
 			}
 
-			if (resource?.scheme === filterByScheme) {
+			if (resource && resource.scheme === filterByScheme && (!filterByAuthority || resource.authority === filterByAuthority)) {
 				return resource;
 			}
 		}
@@ -1110,6 +1145,20 @@ export class HistoryService extends Disposable implements IHistoryService {
 	}
 
 	//#endregion
+
+	override dispose(): void {
+		super.dispose();
+
+		for (const [, stack] of this.editorGroupScopedNavigationStacks) {
+			stack.disposable.dispose();
+		}
+
+		for (const [, editors] of this.editorScopedNavigationStacks) {
+			for (const [, stack] of editors) {
+				stack.disposable.dispose();
+			}
+		}
+	}
 }
 
 registerSingleton(IHistoryService, HistoryService, InstantiationType.Eager);
@@ -1664,6 +1713,7 @@ ${entryLabels.join('\n')}
 	}
 
 	remove(arg1: EditorInput | FileChangesEvent | FileOperationEvent | GroupIdentifier): void {
+		const previousStackSize = this.stack.length;
 
 		// Remove all stack entries that match `arg1`
 		this.stack = this.stack.filter(entry => {
@@ -1676,6 +1726,10 @@ ${entryLabels.join('\n')}
 
 			return !matches;
 		});
+
+		if (previousStackSize === this.stack.length) {
+			return; // nothing removed
+		}
 
 		// Given we just removed entries, we need to make sure
 		// to remove entries that are now identical and next
